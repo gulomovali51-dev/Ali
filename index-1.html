@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Digital Hand Particle Tracker</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#05070b;font-family:Arial,sans-serif}
+  #stage{position:fixed;inset:0;background:#05070b}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  video{transform:scaleX(-1);opacity:.08}
+  #fx{mix-blend-mode:screen}
+  #ui{
+    position:absolute;left:12px;right:12px;top:12px;z-index:5;
+    display:flex;gap:8px;align-items:center;justify-content:space-between;
+    pointer-events:none
+  }
+  #status{
+    color:#d9ffff;background:rgba(0,0,0,.5);border:1px solid rgba(100,255,255,.25);
+    border-radius:14px;padding:9px 12px;font-size:13px;backdrop-filter:blur(8px)
+  }
+  button{
+    pointer-events:auto;border:0;border-radius:14px;padding:11px 15px;
+    background:#13e6d1;color:#001312;font-weight:700;font-size:14px
+  }
+  #hint{
+    position:absolute;left:50%;bottom:20px;transform:translateX(-50%);
+    z-index:5;color:#bdfefe;background:rgba(0,0,0,.45);
+    padding:9px 13px;border-radius:14px;font-size:12px;text-align:center;
+    white-space:nowrap
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="camera" autoplay playsinline muted></video>
+  <canvas id="fx"></canvas>
+  <div id="ui">
+    <div id="status">Kamera tayyorlanmoqda...</div>
+    <button id="start">Kamerani yoqish</button>
+  </div>
+  <div id="hint">Qo'lingni kameraga ko'rsat ✋</div>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs";
+
+const video = document.getElementById("camera");
+const canvas = document.getElementById("fx");
+const ctx = canvas.getContext("2d", {alpha:true});
+const statusEl = document.getElementById("status");
+const startBtn = document.getElementById("start");
+
+const MODEL =
+  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17]
+];
+
+let handLandmarker = null;
+let running = false;
+let lastVideoTime = -1;
+let points = [];
+let particles = [];
+let W = 0, H = 0;
+let lastLandmarks = null;
+
+function resize(){
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  canvas.width = Math.floor(W*dpr);
+  canvas.height = Math.floor(H*dpr);
+  canvas.style.width = W+"px";
+  canvas.style.height = H+"px";
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+addEventListener("resize", resize);
+resize();
+
+function makeParticles(n=1800){
+  particles = Array.from({length:n}, () => ({
+    x:Math.random()*W, y:Math.random()*H,
+    vx:0, vy:0, life:Math.random()*100
+  }));
+}
+makeParticles();
+
+async function initModel(){
+  statusEl.textContent = "AI modeli yuklanmoqda...";
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+  );
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: MODEL, delegate: "GPU" },
+    runningMode: "VIDEO",
+    numHands: 2,
+    minHandDetectionConfidence: 0.5,
+    minHandPresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+  statusEl.textContent = "Tayyor — qo'lingni ko'rsat";
+}
+
+async function startCamera(){
+  if(!handLandmarker) await initModel();
+
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video:{
+        facingMode:"user",
+        width:{ideal:1280},
+        height:{ideal:720},
+        frameRate:{ideal:30,max:30}
+      },
+      audio:false
+    });
+    video.srcObject = stream;
+    await video.play();
+    running = true;
+    startBtn.style.display = "none";
+    statusEl.textContent = "Tracking: qo'lni qidirmoqda...";
+    requestAnimationFrame(loop);
+  }catch(err){
+    console.error(err);
+    statusEl.textContent =
+      "Kamera ishlamadi. Brauzerda kamera ruxsatini bering.";
+  }
+}
+
+startBtn.addEventListener("click", startCamera);
+
+function landmarkToScreen(p){
+  // Kamera video mirror qilingan, shuning uchun X ham mirror qilinadi.
+  return { x:(1-p.x)*W, y:p.y*H };
+}
+
+function smoothLandmarks(newPts){
+  if(!lastLandmarks) {
+    lastLandmarks = newPts.map(p=>({...p}));
+    return lastLandmarks;
+  }
+  for(let i=0;i<newPts.length;i++){
+    lastLandmarks[i].x += (newPts[i].x-lastLandmarks[i].x)*0.45;
+    lastLandmarks[i].y += (newPts[i].y-lastLandmarks[i].y)*0.45;
+  }
+  return lastLandmarks;
+}
+
+function drawHand(landmarks){
+  const smoothed = smoothLandmarks(landmarks);
+  points = smoothed.map(landmarkToScreen);
+
+  // Skelet chiziqlari
+  ctx.save();
+  ctx.lineWidth = 2.2;
+  ctx.strokeStyle = "rgba(35,255,235,.95)";
+  ctx.shadowBlur = 12;
+  ctx.shadowColor = "rgba(35,255,235,.9)";
+  for(const [a,b] of CONNECTIONS){
+    ctx.beginPath();
+    ctx.moveTo(points[a].x,points[a].y);
+    ctx.lineTo(points[b].x,points[b].y);
+    ctx.stroke();
+  }
+
+  // Landmark nuqtalari
+  for(const p of points){
+    ctx.beginPath();
+    ctx.arc(p.x,p.y,3.2,0,Math.PI*2);
+    ctx.fillStyle = "rgba(100,255,245,.95)";
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function nearestTarget(x,y){
+  let best=null, bestD=Infinity;
+  for(const p of points){
+    const dx=p.x-x, dy=p.y-y;
+    const d=dx*dx+dy*dy;
+    if(d<bestD){bestD=d;best=p}
+  }
+  return best;
+}
+
+function drawParticles(){
+  // Har bir particle qo'l landmarklariga tortiladi, keyin ozgina tarqaladi.
+  for(const q of particles){
+    const t = nearestTarget(q.x,q.y);
+
+    if(t){
+      const dx=t.x-q.x, dy=t.y-q.y;
+      const d=Math.sqrt(dx*dx+dy*dy)+0.001;
+
+      // Qo'lga yaqin particle'lar yig'iladi; uzoqlari qayta "chang" bo'ladi.
+      const pull = Math.min(0.085, 7/d);
+      q.vx += dx*pull;
+      q.vy += dy*pull;
+    }
+
+    q.vx *= .90;
+    q.vy *= .90;
+    q.x += q.vx;
+    q.y += q.vy;
+
+    if(q.x<-20||q.x>W+20||q.y<-20||q.y>H+20){
+      q.x=Math.random()*W;
+      q.y=Math.random()*H;
+      q.vx=q.vy=0;
+    }
+
+    // faqat landmarklar atrofidagi particle'larni yorqinroq qilamiz
+    let near=Infinity;
+    for(const p of points){
+      const dx=p.x-q.x,dy=p.y-q.y;
+      near=Math.min(near,dx*dx+dy*dy);
+    }
+
+    if(near<4200){
+      const alpha=Math.max(.08,1-Math.sqrt(near)/65);
+      ctx.fillStyle=`rgba(35,255,235,${alpha*.9})`;
+      ctx.fillRect(q.x,q.y,1.4,1.4);
+    }else if(points.length){
+      ctx.fillStyle="rgba(35,255,235,.025)";
+      ctx.fillRect(q.x,q.y,1,1);
+    }
+  }
+}
+
+function drawGlow(){
+  if(!points.length) return;
+  ctx.save();
+  ctx.globalCompositeOperation="lighter";
+  for(const p of points){
+    const g=ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,28);
+    g.addColorStop(0,"rgba(80,255,240,.24)");
+    g.addColorStop(1,"rgba(80,255,240,0)");
+    ctx.fillStyle=g;
+    ctx.beginPath();
+    ctx.arc(p.x,p.y,28,0,Math.PI*2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function loop(){
+  if(!running) return;
+
+  ctx.clearRect(0,0,W,H);
+
+  if(video.readyState>=2 && video.currentTime!==lastVideoTime){
+    lastVideoTime=video.currentTime;
+    const result=handLandmarker.detectForVideo(video, performance.now());
+
+    points=[];
+    if(result.landmarks && result.landmarks.length){
+      // Eng ko'ringan ikkita qo'lni birlashtiramiz.
+      for(const hand of result.landmarks){
+        drawHand(hand);
+      }
+      statusEl.textContent=`Tracking: ${result.landmarks.length} ta qo'l`;
+    }else{
+      statusEl.textContent="Tracking: qo'lni kameraga ko'rsat";
+      lastLandmarks=null;
+    }
+  }
+
+  drawParticles();
+  drawGlow();
+
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
